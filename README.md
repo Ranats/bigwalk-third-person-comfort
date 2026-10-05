@@ -4,6 +4,8 @@ A third-person camera mod built specifically for players who get motion sick in
 first person. It puts the camera over your shoulder, **smooths out head bob**,
 and shows your full character — head, body, legs and all.
 
+![Third person view in Big Walk](https://raw.githubusercontent.com/Ranats/bigwalk-third-person-comfort/main/docs/preview.gif)
+
 Unlike a general-purpose camera tool, every default here is tuned for comfort:
 stable horizon-aware follow, no input hijacking, and the game's own look
 controls stay untouched.
@@ -79,6 +81,10 @@ your save.
 ## Support
 
 Found a problem? Press `F8` in game and attach `BepInEx/LogOutput.log`.
+
+If this saved your stomach, you can buy me a coffee:
+[GitHub Sponsors](https://github.com/sponsors/Ranats) ·
+[Ko-fi](https://ko-fi.com/ranats)
 
 ## Build from source
 
