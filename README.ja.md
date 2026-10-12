@@ -39,9 +39,23 @@ BepInEx プラグインです。酔い対策として、視点の安定した追
 - `Camera.Stabilize` / `StabilizeAmount` / `StabilizeSmoothTime` …
   カメラピボットを平滑化して頭ボブを除去（酔い対策の主機能、初期値ON）
 - `Camera.LevelHorizon` … `true` でカメラのロールを除去し常に水平維持
+- `Camera.AimConverge` / `AimSmoothTime` / `InteractDistance` /
+  `InteractZoomTime` / `AimMaxAngle` … ゲームがインタラクト対象を
+  照準したらカメラがほぼ一人称まで滑らかに寄り（ブーム距離
+  `InteractDistance`・オフセット減衰・頭と胴体は自動で非表示）、
+  照準点が画面中央に一致する。対象を外すと元の三人称に戻る
+  （初期値ON・距離0.1m・ズーム時間0.3s・傾き上限20°）
+- `Camera.CastFromCamera` … `true` でローカルプレイヤーの照準
+  レイキャストを三人称カメラ起点（画面中央スルー）に差し替える
+  （実験的・**初期値OFF**）。画面中央に映るものがそのまま掴める対象に
+  なるが、ゲーム側の caster は手のリーチ判定にも使われており、
+  カメラ起点ヒットを流すとキャラクターが不安定になるため現状OFF推奨
 - `Body.ShowBody` … 自分の全身（remote用ボディ）を表示
 - `Body.HideHead` … 頭が視界を遮る場合に `true`
 - `UI.ShowStatus` … 左下のステータス表示
+- `UI.ShowAimDot` … ゲームの実照準位置に小さなドットを表示(初期値ON)。
+  ターゲット有りならその上、無しのときはキャラクター正面レイの着弾点。
+  `CastFromCamera` が効いているかの診断にもなる
 - `Camera.ToggleKey` / `DumpKey` … キー変更（`F4`, `V`, `Keypad0` 等の KeyCode 名）
 
 ## 動作の仕組み

@@ -1,3 +1,4 @@
+using System;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
@@ -31,9 +32,16 @@ public class Plugin : BasePlugin
     internal static ConfigEntry<float> StabilizeAmount;
     internal static ConfigEntry<float> StabilizeSmoothTime;
     internal static ConfigEntry<bool> LevelHorizon;
+    internal static ConfigEntry<bool> AimConverge;
+    internal static ConfigEntry<float> AimSmoothTime;
+    internal static ConfigEntry<float> AimMaxAngle;
+    internal static ConfigEntry<float> InteractDistance;
+    internal static ConfigEntry<float> InteractZoomTime;
+    internal static ConfigEntry<bool> CastFromCamera;
     internal static ConfigEntry<bool> ShowBody;
     internal static ConfigEntry<bool> HideHead;
     internal static ConfigEntry<bool> ShowStatus;
+    internal static ConfigEntry<bool> ShowAimDot;
 
     public override void Load()
     {
@@ -65,6 +73,28 @@ public class Plugin : BasePlugin
             "Seconds of smoothing on the pivot. Higher = steadier but laggier.");
         LevelHorizon = Config.Bind(cam, nameof(LevelHorizon), false,
             "Force the camera level with the horizon (removes roll).");
+        AimConverge = Config.Bind(cam, nameof(AimConverge), true,
+            "Rotate the camera so the screen centre lands on whatever the game is " +
+            "aiming at (grabs, pecks, switches). Fixes the interaction point being " +
+            "offset from the crosshair in third person.");
+        AimSmoothTime = Config.Bind(cam, nameof(AimSmoothTime), 0.08f,
+            "Seconds of smoothing on the aim point as it moves between targets. 0 = snap.");
+        AimMaxAngle = Config.Bind(cam, nameof(AimMaxAngle), 20f,
+            "Maximum degrees the camera may tilt away from the look direction to " +
+            "centre a target, applied only while leaned in to an interactable.");
+        InteractDistance = Config.Bind(cam, nameof(InteractDistance), 0.05f,
+            "Boom distance while an interactable is targeted: at ~0 the camera " +
+            "sits on the eye itself, so the game's aim ray runs exactly " +
+            "through the screen centre. Returns to third person when the " +
+            "target clears.");
+        InteractZoomTime = Config.Bind(cam, nameof(InteractZoomTime), 0.4f,
+            "SmoothDamp time for the lean-in/out; the return takes ~1.5x " +
+            "longer. Raise for a slower, more cinematic ease.");
+        CastFromCamera = Config.Bind(cam, nameof(CastFromCamera), false,
+            "EXPERIMENTAL: route the local player's interact cast through the " +
+            "third-person camera, so whatever is under the screen centre is what " +
+            "you interact with. The game's caster feeds reach/hand checks too, " +
+            "so this can destabilise the character. Off = character-forward cast.");
 
         var body = "Body";
         ShowBody = Config.Bind(body, nameof(ShowBody), true,
@@ -75,14 +105,22 @@ public class Plugin : BasePlugin
         var ui = "UI";
         ShowStatus = Config.Bind(ui, nameof(ShowStatus), true,
             "Show a small on-screen label while third person is active.");
+        ShowAimDot = Config.Bind(ui, nameof(ShowAimDot), true,
+            "Draw a small dot where the game is actually aiming: on the target " +
+            "when one is highlighted, or on the character's eye ray when nothing " +
+            "is (only in character-forward cast mode). Makes the invisible aim " +
+            "legible and doubles as a diagnostic for CastFromCamera.");
 
         ClassInjector.RegisterTypeInIl2Cpp<ThirdPersonComponent>();
         ClassInjector.RegisterTypeInIl2Cpp<CameraDriver>();
 
         var go = new GameObject("BigWalkThirdPerson");
-        Object.DontDestroyOnLoad(go);
+        UnityEngine.Object.DontDestroyOnLoad(go);
         go.hideFlags = HideFlags.HideAndDontSave;
         go.AddComponent(Il2CppInterop.Runtime.Il2CppType.Of<ThirdPersonComponent>());
+
+        try { CameraCastPatch.Apply(new HarmonyLib.Harmony(Guid + ".cameracast")); }
+        catch (Exception e) { LogSource.LogWarning($"Camera-cast patch failed: {e.Message}"); }
 
         LogSource.LogInfo($"{Name} {Version} loaded. Toggle with {ToggleKey.Value}.");
     }

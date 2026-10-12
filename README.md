@@ -59,10 +59,24 @@ On Steam Deck / Linux add to Launch Options:
 * `Stabilize` (true), `StabilizeAmount` (0.85), `StabilizeSmoothTime` (0.12s) —
   head-bob removal. Lower `Amount` if the camera feels too detached.
 * `LevelHorizon` (false) — force the camera level (removes roll).
+* `AimConverge` (true), `AimSmoothTime` (0.08s), `InteractDistance` (0.1m),
+  `InteractZoomTime` (0.3s), `AimMaxAngle` (20°) — when the game highlights
+  an interactable the camera leans in to nearly first person (boom collapses
+  to `InteractDistance`, offsets ease to zero, head+torso hide) so the game's
+  own aim ray runs through the screen centre, then returns to third person
+  when the target clears. Fixes the crosshair/interact-point offset.
+* `CastFromCamera` (false, experimental) — reroute the local player's
+  interact raycast through the third-person camera so the thing under the
+  screen centre is literally what you interact with. Currently off by
+  default: the game's caster also feeds reach/hand checks, and substituting
+  camera hits there can destabilise the character.
 * `ShowBody` (true) — draw your full remote body; `HideHead` hides the head if
   it ever blocks your view.
 * `Mode` — `Direct` (default, recommended) or `Guide` (experimental).
 * `ShowStatus` — the little status label.
+* `ShowAimDot` (true) — a small on-screen dot marking where the game is
+  actually aiming (the highlighted target, or the character's eye ray when
+  nothing is targeted). Doubles as a diagnostic for `CastFromCamera`.
 * `ToggleKey`, `DumpKey` — keybinds (any `KeyCode` name).
 
 ## Notes

@@ -1,5 +1,6 @@
 using System;
 using Il2CppInterop.Runtime.Injection;
+using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using UnityEngine;
 
 namespace BigWalkThirdPerson;
@@ -37,12 +38,41 @@ public class ThirdPersonComponent : MonoBehaviour
     private bool bodyApplied;
     private bool origHideTorso;
     private Vector3 origCamLocalPos;
+    private Quaternion origCamLocalRot;
     private int collideMode = -1; // -1 = not probed, 0 = none works, 1 = sphere, 2 = ray
     private int collisionMask;
     private string lastError;
     private float lastErrorTime;
     private Vector3 smoothPivot;
     private bool hasSmoothPivot;
+    private Vector3 smoothAim;
+    private bool hasSmoothAim;
+    private bool hasBoom;
+    // The view rotation the game itself wants, tracked separately from
+    // cam.transform.rotation because we overwrite that every frame - reading
+    // it back would feed our own convergence offset into the base and the
+    // camera would drift and never return.
+    private Quaternion gameRot;
+    private Quaternion appliedRot;
+    private Quaternion prevPivotRot;
+    private Quaternion prevCharRot;
+    private bool hasGameRot, hasAppliedRot, hasPrevPivot, hasPrevChar;
+    private float aimProx;          // 0 = free third person, 1 = leaned to eye
+    private float aimProxVel;       // SmoothDamp velocity for aimProx
+    private float aimGraceUntil;    // target-loss grace to eat flicker
+    private float fpProx;           // wheel-driven first-person blend
+    private float fpProxVel;
+    private bool wheelFP;           // scrolled in past min zoom = first person
+    private bool proxHeadHidden;    // head+torso hidden while leaned in
+
+    // Shared with CameraCastPatch: the transform the camera is actually
+    // rendered from, so the interact cast can be rerouted through it.
+    internal static ThirdPersonComponent Current;
+    internal bool IsActiveForCast => active && !suspended && hasBoom && Plugin.CastFromCamera.Value;
+    internal Vector3 LastBoomPos { get; private set; }
+    internal Quaternion LastBoomRot { get; private set; }
+    internal Vector3 LastEyePos { get; private set; }
+    internal Quaternion LastEyeRot { get; private set; }
 
     private void Awake()
     {
@@ -52,6 +82,7 @@ public class ThirdPersonComponent : MonoBehaviour
         guide = g.transform;
         curDistance = Plugin.Distance.Value;
         wantEnabled = Plugin.StartEnabled.Value;
+        Current = this;
     }
 
     private void Update()
@@ -66,8 +97,24 @@ public class ThirdPersonComponent : MonoBehaviour
             {
                 float scroll = Input.GetAxis("Mouse ScrollWheel");
                 if (scroll != 0f)
-                    curDistance = Mathf.Clamp(curDistance - scroll * Plugin.ZoomSpeed.Value,
-                        Plugin.MinDistance.Value, Plugin.MaxDistance.Value);
+                {
+                    if (scroll > 0f && !wheelFP
+                        && curDistance <= Plugin.MinDistance.Value + 0.001f)
+                    {
+                        // Scrolled in past the minimum: blend to first person.
+                        wheelFP = true;
+                    }
+                    else if (scroll < 0f && wheelFP)
+                    {
+                        // Scrolled out from first person: back to third.
+                        wheelFP = false;
+                    }
+                    else if (!wheelFP)
+                    {
+                        curDistance = Mathf.Clamp(curDistance - scroll * Plugin.ZoomSpeed.Value,
+                            Plugin.MinDistance.Value, Plugin.MaxDistance.Value);
+                    }
+                }
             }
         }
         catch (Exception e)
@@ -120,6 +167,75 @@ public class ThirdPersonComponent : MonoBehaviour
         else
         {
             hasSmoothPivot = false;
+        }
+
+        // Interact lean-in, once per frame. While the game highlights an
+        // interactable, aimProx eases toward 1 and the boom collapses toward
+        // the eye so the game's own aim point lands at the screen centre;
+        // when it clears the blend eases back out. Smoothing the blend also
+        // keeps target flicker from snapping the camera.
+        Vector3 rawAim = default;
+        bool seesTarget = active && RefsOk() && Plugin.AimConverge.Value
+            && TryGetAimPoint(out rawAim);
+        // Cursor-driven trigger: even before the game acquires the target,
+        // if the screen-centre ray finds an interactable inside the
+        // character's reach, lean in - near first person the game's own eye
+        // ray lands on it and the normal targeting takes over.
+        if (!seesTarget && active && RefsOk() && Plugin.AimConverge.Value
+            && TryGetCursorInteractable(out Vector3 cursorAim))
+        {
+            seesTarget = true;
+            rawAim = cursorAim;
+        }
+        if (seesTarget) aimGraceUntil = Time.unscaledTime + 0.15f;
+        // A short grace after the target drops keeps single-frame flickers
+        // from bouncing the lean in and out.
+        bool hasTarget = seesTarget || Time.unscaledTime < aimGraceUntil;
+        if (seesTarget)
+        {
+            if (!hasSmoothAim || (rawAim - smoothAim).sqrMagnitude > 4f)
+            {
+                smoothAim = rawAim;
+                hasSmoothAim = true;
+            }
+            else
+            {
+                float tau = Mathf.Max(0.01f, Plugin.AimSmoothTime.Value);
+                smoothAim = Vector3.Lerp(smoothAim, rawAim,
+                    1f - Mathf.Exp(-Time.deltaTime / tau));
+            }
+        }
+        float proxTime = hasTarget
+            ? Plugin.InteractZoomTime.Value
+            : Plugin.InteractZoomTime.Value * 1.5f;
+        aimProx = Mathf.SmoothDamp(aimProx, hasTarget ? 1f : 0f,
+            ref aimProxVel, Mathf.Max(0.05f, proxTime));
+        if (!hasTarget && aimProx <= 0.001f)
+        {
+            aimProx = 0f;
+            aimProxVel = 0f;
+            hasSmoothAim = false;
+        }
+
+        // Wheel-driven first-person blend, independent of the interact lean.
+        fpProx = Mathf.SmoothDamp(fpProx, wheelFP ? 1f : 0f, ref fpProxVel,
+            Mathf.Max(0.05f, Plugin.InteractZoomTime.Value));
+        if (!wheelFP && fpProx <= 0.001f) { fpProx = 0f; fpProxVel = 0f; }
+
+        float proxAll = Mathf.Max(aimProx, fpProx);
+        // Leaned in nearly to first person the head and torso would fill the
+        // screen; hide both with a small hysteresis.
+        if (active && Plugin.ShowBody.Value && pc != null && pc.looks != null)
+        {
+            bool wantHide = proxHeadHidden ? proxAll > 0.35f : proxAll > 0.5f;
+            if (wantHide != proxHeadHidden)
+            {
+                proxHeadHidden = wantHide;
+                SetHeadVisible(!proxHeadHidden && !Plugin.HideHead.Value);
+                SetRenderersVisible(pc.looks.torsoRenderers, !proxHeadHidden);
+                SetRenderersVisible(pc.looks.legsRenderers, !proxHeadHidden);
+                pc.looks.SetHideLocalTorso(proxHeadHidden);
+            }
         }
     }
 
@@ -180,7 +296,17 @@ public class ThirdPersonComponent : MonoBehaviour
     {
         active = true;
         suspended = false;
+        hasGameRot = hasAppliedRot = hasPrevPivot = hasPrevChar = false;
+        hasSmoothAim = false;
+        hasBoom = false;
+        aimProx = 0f;
+        aimProxVel = 0f;
+        fpProx = 0f;
+        fpProxVel = 0f;
+        wheelFP = false;
+        proxHeadHidden = false;
         origCamLocalPos = cam.transform.localPosition;
+        origCamLocalRot = cam.transform.localRotation;
         BuildCollisionMask();
 
         if (Plugin.Mode.Value == CameraMode.Guide)
@@ -196,7 +322,7 @@ public class ThirdPersonComponent : MonoBehaviour
             EnsureDriver();
         }
 
-        if (Plugin.ShowBody.Value)
+        if (Plugin.ShowBody.Value && pc.looks != null)
         {
             origHideTorso = pc.looks.hideLocalTorso;
             ApplyBody();
@@ -293,17 +419,69 @@ public class ThirdPersonComponent : MonoBehaviour
             pivotPos = Vector3.Lerp(pivotPos, smoothPivot,
                 Mathf.Clamp01(Plugin.StabilizeAmount.Value));
 
-        rot = cam.transform.rotation; // view direction the game computed
+        // Base view rotation. CameraPivot is the look-driven transform and is
+        // never written by us, so it is the clean source: yaw stays glued to
+        // the character's facing while pitch is the view. Fall back to
+        // tracking cam.transform.rotation when the pivot diverges too far,
+        // ignoring our own applied rotation and keeping roll pinned.
+        Quaternion rawRot = cam.transform.rotation;
+        Quaternion pivotRot = pivot != null ? pivot.rotation : Quaternion.identity;
+        Quaternion charRot = pc.transform.rotation;
+        Quaternion pivotDelta = hasPrevPivot
+            ? pivotRot * Quaternion.Inverse(prevPivotRot) : Quaternion.identity;
+        Quaternion charDelta = hasPrevChar
+            ? charRot * Quaternion.Inverse(prevCharRot) : Quaternion.identity;
+        Quaternion viewDelta = Quaternion.Inverse(charDelta) * pivotDelta;
+
+        if (pivot != null && Quaternion.Angle(pivotRot, rawRot) < 60f)
+        {
+            gameRot = pivotRot;
+            hasGameRot = true;
+        }
+        else if (!hasGameRot)
+        {
+            gameRot = rawRot;
+            hasGameRot = true;
+        }
+        else if (hasAppliedRot && Quaternion.Angle(rawRot, appliedRot) < 0.001f)
+        {
+            // No write this frame: the camera still holds our rotation.
+        }
+        else if (hasAppliedRot
+            && Quaternion.Angle(rawRot, viewDelta * appliedRot) < 0.5f)
+        {
+            gameRot = viewDelta * gameRot;
+        }
+        else
+        {
+            gameRot = rawRot;
+        }
+        // Roll never belongs in the view base; any that leaked in via delta
+        // composition or a converged write is dropped so it cannot build up.
+        var ge = gameRot.eulerAngles;
+        if (Mathf.Abs(ge.z) > 0.01f) gameRot = Quaternion.Euler(ge.x, ge.y, 0f);
+        prevPivotRot = pivotRot;
+        prevCharRot = charRot;
+        hasPrevPivot = hasPrevChar = true;
+        rot = gameRot;
         if (Plugin.LevelHorizon.Value)
         {
             var e = rot.eulerAngles;
             rot = Quaternion.Euler(e.x, e.y, 0f);
         }
+        Quaternion eyeRot = rot; // view direction before any convergence
         Vector3 fwd = rot * Vector3.forward;
         Vector3 right = rot * Vector3.right;
 
-        Vector3 anchor = pivotPos + Vector3.up * Plugin.Height.Value + right * Plugin.Shoulder.Value;
-        float dist = curDistance;
+        // Lean-in: while an interactable is targeted (or the wheel hits the
+        // zoom floor), the height/shoulder offsets collapse toward the eye
+        // and the boom shortens, so the game's own aim ray nearly coincides
+        // with the camera ray.
+        float prox = Mathf.Clamp01(Mathf.Max(aimProx, fpProx));
+        Vector3 anchor = pivotPos + Vector3.up * (Plugin.Height.Value * (1f - prox))
+            + right * (Plugin.Shoulder.Value * (1f - prox));
+        float dist = Mathf.Max(0.05f,
+            Mathf.Lerp(curDistance, Plugin.InteractDistance.Value, prox));
         Vector3 desired = anchor - fwd * dist;
 
         if (Plugin.Collision.Value && CollideMode() != 0)
@@ -321,7 +499,139 @@ public class ThirdPersonComponent : MonoBehaviour
                 desired = anchor + dir * Mathf.Max(h.distance, minDist);
         }
         pos = desired;
+
+        // Residual tilt: mid-transition a bounded convergence keeps the aim
+        // near centre. The budget humps to zero at both ends - free third
+        // person is untouched and the fully leaned-in pose is the game's own
+        // first-person camera, where the aim ray already crosses the centre.
+        if (hasSmoothAim && prox > 0.001f)
+        {
+            Vector3 toAim = smoothAim - desired;
+            // World-up keeps the converged rotation roll-free; a nearly
+            // vertical aim is degenerate, so skip those frames entirely.
+            if (toAim.sqrMagnitude > 0.0025f && Vector3.Dot(toAim, fwd) > 0f
+                && Mathf.Abs(Vector3.Dot(toAim.normalized, Vector3.up)) < 0.98f)
+            {
+                Quaternion targetRot = Quaternion.LookRotation(toAim, Vector3.up);
+                rot = Quaternion.RotateTowards(rot, targetRot,
+                    Mathf.Min(Plugin.AimMaxAngle.Value,
+                        Plugin.AimMaxAngle.Value * prox * (1f - prox) * 4f));
+            }
+        }
+
+        // Fully leaned in, reproduce the game's first-person camera exactly:
+        // the local offset/rotation captured before we took over, applied in
+        // pivot space. The eye ray then crosses the screen centre by
+        // construction - identical to toggling F4 off.
+        Vector3 fpPos = pivot != null
+            ? pivot.position + pivotRot * origCamLocalPos
+            : desired;
+        Quaternion fpRot = pivotRot * origCamLocalRot;
+        pos = Vector3.Lerp(pos, fpPos, prox);
+        rot = Quaternion.Slerp(rot, fpRot, prox);
+        LastBoomPos = pos;
+        LastBoomRot = rot;
+        LastEyePos = pivotPos;
+        LastEyeRot = eyeRot;
+        appliedRot = rot;
+        hasAppliedRot = true;
+        hasBoom = true;
         return true;
+    }
+
+    /// <summary>
+    /// World-space point of the interactable the game is currently aiming at,
+    /// or false when there is none. Only real targets count - the free-floating
+    /// crosshair ring lands on arbitrary surfaces (e.g. the floor), and
+    /// converging on those makes the camera dig into the ground.
+    /// </summary>
+    private bool TryGetAimPoint(out Vector3 aim)
+    {
+        aim = default;
+        if (pc == null) return false;
+        try
+        {
+            var caster = pc.caster;
+            if (caster != null)
+            {
+                if (caster.castableTarget != null)
+                {
+                    var t = caster.castableTarget.GetCrosshairTransform();
+                    aim = t != null ? t.position : caster.hitPosition;
+                    return true;
+                }
+                if (caster.castProp != null)
+                {
+                    var cp = caster.castProp.customCrosshairPoint;
+                    aim = cp != null ? cp.position : caster.hitPosition;
+                    return true;
+                }
+                if (caster.castCharacter != null)
+                {
+                    aim = caster.hitPosition;
+                    return true;
+                }
+            }
+            var decisions = pc.decisions;
+            if (decisions != null && decisions.heldDownSwitch != null)
+            {
+                var t = decisions.heldDownSwitch.GetCrosshairTransform();
+                aim = t != null ? t.position : decisions.heldDownSwitch.transform.position;
+                return true;
+            }
+        }
+        catch (Exception) { }
+        return false;
+    }
+
+    /// <summary>
+    /// Screen-centre query for a not-yet-highlighted interactable inside the
+    /// character's reach. Used to start the lean-in from the reticle itself.
+    /// The ray is evaluated from the *un-leaned* boom pose so the trigger
+    /// cannot flap as the camera zooms: a low item visible from the boom but
+    /// not the eye would otherwise bounce the lean in and out.
+    /// </summary>
+    private bool TryGetCursorInteractable(out Vector3 aim)
+    {
+        aim = default;
+        if (!hasBoom || cam == null || CollideMode() == 0) return false;
+        try
+        {
+            Vector3 eyeFwd = LastEyeRot * Vector3.forward;
+            Vector3 eyeRight = LastEyeRot * Vector3.right;
+            Vector3 refAnchor = LastEyePos + Vector3.up * Plugin.Height.Value
+                + eyeRight * Plugin.Shoulder.Value;
+            var ray = new Ray(refAnchor - eyeFwd * curDistance, eyeFwd);
+            float maxDist = curDistance + 4f;
+            int mask = pc.caster != null ? pc.caster.layerMask.value : collisionMask;
+            RaycastHit h;
+            bool hit = collideMode == 1
+                ? Physics.SphereCast(ray, 0.05f, out h, maxDist, mask, QueryTriggerInteraction.Ignore)
+                : Physics.Raycast(ray, out h, maxDist, mask, QueryTriggerInteraction.Ignore);
+            if (!hit || h.collider == null) return false;
+            try { if (h.collider.transform.IsChildOf(pc.transform)) return false; }
+            catch (Exception) { }
+            if (!IsInteractable(h.collider)) return false;
+            float reach = 2f;
+            try { if (pc.caster != null) reach = pc.caster.raycastMaxDistance; }
+            catch (Exception) { }
+            if (Vector3.Distance(h.point, LastEyePos) > reach * 1.15f) return false;
+            aim = h.point;
+            return true;
+        }
+        catch (Exception) { return false; }
+    }
+
+    private static bool IsInteractable(Collider col)
+    {
+        try
+        {
+            if (col.GetComponentInParent(Il2CppInterop.Runtime.Il2CppType.Of<Prop>()) != null) return true;
+            if (col.GetComponentInParent(Il2CppInterop.Runtime.Il2CppType.Of<CastableTarget>()) != null) return true;
+            if (col.GetComponentInParent(Il2CppInterop.Runtime.Il2CppType.Of<PeckSwitch>()) != null) return true;
+        }
+        catch (Exception) { }
+        return false;
     }
 
     private void LateUpdateGuide()
@@ -362,9 +672,16 @@ public class ThirdPersonComponent : MonoBehaviour
     private void ApplyBody()
     {
         if (pc == null || pc.looks == null) return;
-        if (!bodyApplied) pc.looks.SetBodyToRemoteMode();
-        if (pc.looks.hideLocalTorso) pc.looks.SetHideLocalTorso(false);
-        SetHeadVisible(!Plugin.HideHead.Value);
+        if (!bodyApplied || pc.looks.currentLookType != PlayerLooks.LookType.Remote)
+        {
+            if (bodyApplied)
+                LogThrottled("bodymode", $"Game reset look mode to {pc.looks.currentLookType}; re-applying remote body.");
+            pc.looks.SetBodyToRemoteMode();
+        }
+        pc.looks.SetHideLocalTorso(proxHeadHidden);
+        SetHeadVisible(!Plugin.HideHead.Value && !proxHeadHidden);
+        SetRenderersVisible(pc.looks.torsoRenderers, !proxHeadHidden);
+        SetRenderersVisible(pc.looks.legsRenderers, !proxHeadHidden);
         bodyApplied = true;
     }
 
@@ -374,6 +691,8 @@ public class ThirdPersonComponent : MonoBehaviour
         try
         {
             SetHeadVisible(true);
+            SetRenderersVisible(pc.looks.torsoRenderers, true);
+            SetRenderersVisible(pc.looks.legsRenderers, true);
             pc.looks.SetBodyToLocalMode();
             if (pc.looks.hideLocalTorso != origHideTorso) pc.looks.SetHideLocalTorso(origHideTorso);
             bodyApplied = false;
@@ -386,11 +705,16 @@ public class ThirdPersonComponent : MonoBehaviour
 
     private void SetHeadVisible(bool visible)
     {
-        var heads = pc.looks.headRenderers;
-        if (heads == null) return;
-        for (int i = 0; i < heads.Count; i++)
-            if (heads[i] != null && heads[i].renderer != null)
-                heads[i].renderer.enabled = visible;
+        if (pc.looks == null) return;
+        SetRenderersVisible(pc.looks.headRenderers, visible);
+    }
+
+    private static void SetRenderersVisible(Il2CppReferenceArray<PlayerLooks.LooksRenderer> list, bool visible)
+    {
+        if (list == null) return;
+        for (int i = 0; i < list.Count; i++)
+            if (list[i] != null && list[i].renderer != null)
+                list[i].renderer.enabled = visible;
     }
 
     private void OnGUI()
@@ -404,11 +728,49 @@ public class ThirdPersonComponent : MonoBehaviour
             GUI.Label(new Rect(r.x + 1, r.y + 1, r.width, r.height), s);
             GUI.color = Color.white;
             GUI.Label(r, s);
+            if (Plugin.ShowAimDot.Value && hasBoom) DrawAimDot();
         }
         catch (Exception e)
         {
             LogThrottled("gui", $"OnGUI: {e.Message}");
         }
+    }
+
+    /// <summary>
+    /// A small dot drawn on the game's highlighted interact target, doubling
+    /// as a convergence diagnostic. Not drawn without a target - an eye-ray
+    /// fallback lands on the character's head on screen and reads as noise.
+    /// </summary>
+    private void DrawAimDot()
+    {
+        if (!TryGetAimPoint(out Vector3 aim)) return;
+        Vector3 sp = cam.WorldToScreenPoint(aim);
+        if (sp.z <= 0f) return;
+        const float size = 12f;
+        GUI.color = new Color(1f, 1f, 1f, 0.95f);
+        GUI.DrawTexture(new Rect(sp.x - size / 2f, Screen.height - sp.y - size / 2f, size, size), DotTex());
+        GUI.color = Color.white;
+    }
+
+    private static Texture2D dotTex;
+    private static Texture2D DotTex()
+    {
+        if (dotTex != null) return dotTex;
+        var t = new Texture2D(16, 16, TextureFormat.RGBA32, false);
+        var px = new Color[256];
+        for (int y = 0; y < 16; y++)
+            for (int x = 0; x < 16; x++)
+            {
+                float dx = x - 7.5f, dy = y - 7.5f;
+                float d = Mathf.Sqrt(dx * dx + dy * dy);
+                px[y * 16 + x] = (d >= 3.5f && d <= 6.5f) ? Color.white
+                    : (d < 3.5f ? new Color(1f, 1f, 1f, 0.25f)
+                    : (d <= 7.5f ? new Color(1f, 1f, 1f, 0.35f) : new Color(1f, 1f, 1f, 0f)));
+            }
+        t.SetPixels(px);
+        t.Apply();
+        dotTex = t;
+        return t;
     }
 
     private void LogThrottled(string key, string msg)
@@ -425,6 +787,27 @@ public class ThirdPersonComponent : MonoBehaviour
         Plugin.LogSource.LogInfo("=== ThirdPerson dump ===");
         Plugin.LogSource.LogInfo($"cam={(cam != null ? cam.name : "null")} pivot={(pivot != null ? pivot.name : "null")} " +
             $"camLocal={cam?.transform.localPosition} collideMode={collideMode} mask={collisionMask}");
+        try
+        {
+            var c = pc.caster;
+            if (c != null)
+                Plugin.LogSource.LogInfo($"caster: prop={(c.castProp != null ? c.castProp.name : "-")} " +
+                    $"castable={(c.castableTarget != null ? c.castableTarget.name : "-")} " +
+                    $"character={(c.castCharacter != null ? c.castCharacter.name : "-")} " +
+                    $"hit={c.hitPosition} dist={c.castDistance} maxDist={c.raycastMaxDistance}");
+            var hl = pc.highlighter;
+            if (hl != null)
+                Plugin.LogSource.LogInfo($"highlighter: target={(hl.target != null ? hl.target.name : "-")} " +
+                    $"ringActive={(hl.inWorldCrosshair != null && hl.inWorldCrosshair.gameObject.activeInHierarchy)}");
+            var looks = pc.looks;
+            if (looks != null)
+                Plugin.LogSource.LogInfo($"looks: type={looks.currentLookType} hideTorso={looks.hideLocalTorso}");
+            Plugin.LogSource.LogInfo($"boom={LastBoomPos} eye={LastEyePos} castFromCam={IsActiveForCast} prox={aimProx:0.00}");
+            Plugin.LogSource.LogInfo($"rot: cam={cam.transform.eulerAngles} game={gameRot.eulerAngles} " +
+                $"pivot={(pivot != null ? pivot.eulerAngles : Vector3.zero)} char={pc.transform.eulerAngles} " +
+                $"guide={(minder != null && minder._cameraGuide != null ? minder._cameraGuide.eulerAngles : Vector3.zero)}");
+        }
+        catch (Exception e) { Plugin.LogSource.LogWarning($"dump caster: {e.Message}"); }
         DumpTransform(pc.transform, 0);
     }
 
@@ -440,6 +823,7 @@ public class ThirdPersonComponent : MonoBehaviour
     private void OnDestroy()
     {
         if (active) Exit();
+        if (Current == this) Current = null;
     }
 }
 
